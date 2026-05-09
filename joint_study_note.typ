@@ -167,3 +167,7 @@
 - Tutorial on Diffusion Models for Imaging and Vision：https://arxiv.org/abs/2403.18103
 - 笔记见此：#link("notes/Tutorial_on_Diffusion_Models_for_Imaging_and_Vision.typ")[Tutorial_on_Diffusion_Models_for_Imaging_and_Vision.typ]
 
+#pagebreak()
+== 前置基础知识
+
+=== 一、CNN（卷积神经网络）
