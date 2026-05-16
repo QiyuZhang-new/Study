@@ -18,7 +18,7 @@ dataloader = DataLoader(data, batch_size=BATCH_SIZE, shuffle=True, drop_last=Tru
 
 # 2. 取出单张图像
 images, _ = next(iter(dataloader))
-single_image = images[0:1]   # (1, 3, 32, 32)
+single_image = images[0:1]   # (1, 3, 64, 64)
 
 # 3. 可视化前向扩散
 plt.figure(figsize=(15, 15))

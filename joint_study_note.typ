@@ -170,4 +170,7 @@
 #pagebreak()
 == 前置基础知识
 
-=== 一、CNN（卷积神经网络）
+=== 一、CS336
+
+- 笔记见此：#link("notes/CS336.typ")[CS336.typ]
+

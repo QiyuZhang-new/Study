@@ -3,7 +3,7 @@ import torch.nn.functional as F
 
 
 #1.噪声调度（生成beta序列）
-def linear_beta_schedule(timesteps, start=0.0001, end=0.02)->torch.Tensor:
+def linear_beta_schedule(timesteps, start=0.0001, end=0.01)->torch.Tensor:
     """
     生成一个长度为 timesteps 的 beta 序列，从 start 线性递增到 end。每一步的 beta_t 表示该步添加的高斯噪声的方差。
     """

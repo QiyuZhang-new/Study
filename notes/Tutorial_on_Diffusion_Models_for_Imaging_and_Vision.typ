@@ -1,6 +1,6 @@
 // 封面变量，统一管理封面内容
 #let cover = (
-  title: "大二下学习笔记",
+  title: "扩散模型笔记",
   subtitle: "",
   author_line: [#link("https://zhangqiyu.me")[Qiyu Zhang] 编著],
   logo: "myimage.jpg", // 相对或绝对路径
@@ -529,3 +529,410 @@ $ ("DDPM") quad x_(t-1) = 1/(sqrt(alpha_t)) (x_t - (1-alpha_t)/(sqrt(1-overline(
 
 #h(2em)DDPM 与 DDIM 之间的主要区别很微妙。虽然它们都使用 $x_t$ 和 $epsilon^((t)) (x_t)$ 进行更新，但具体的更新公式导致了不同的收敛速度。事实上，在后来将 DDIM 和 DDPM 与随机微分方程联系起来的微分方程文献中，观察到 DDIM 在求解微分方程时采用了一些特殊的加速一阶数值格式。
 
+== 2.7 Diffusion_Model_from_Scratch
+
+#h(2em)在前面的数学推导中，我们已经知道，训练DDPM核心只有两步：
+
+- 1.抽样：$x_t^((m)) = sqrt(overline(alpha_t)) x_0 + sqrt(1-overline(alpha_t)) epsilon_t^((m))$，$epsilon_t^((m)) ~ cal(N)(0, bold(I))$
+
+- 2.优化：$nabla_(theta) {1/M sum_(m=1)^M || hat(x)_(theta) (x_t^((m))) - x_0 ||^2}$
+
+#h(2em)事实上，我们前面通过一个小trick将训练目标转化为一个去噪问题。也就是利用$x_0=1/sqrt(overline(alpha_t)) (x_t - sqrt(1-overline(alpha_t)) epsilon_t)$将目标函数转化为对$ || hat(epsilon)_(theta) (x_t, t) - epsilon_t ||^2$的优化。
+
+#h(2em)下面我将结合我自己的代码实现来说明这两步的细节。
+
+#h(2em)首先是抽样，由于我们要实现一个可以从任意时间步图像去噪的模型，因此对于每一批次（batch），我们随机选择一个时间步$t$，以及随机抽样一个标准高斯噪声$epsilon_t$，然后根据前向扩散的定义计算出$x_t$。理论上，我们的$beta_t=1-alpha_t$表示第$t$步的噪声调度，但在实际实现中，我们直接定义一个序列递增的$beta_t$序列：
+```python
+#forward.py
+
+#1.噪声调度（生成beta序列）
+def linear_beta_schedule(timesteps, start=0.0001, end=0.01)->torch.Tensor:
+    """
+    生成一个长度为 timesteps 的 beta 序列，从 start 线性递增到 end。每一步的 beta_t 表示该步添加的高斯噪声的方差。
+    """
+    return torch.linspace(start, end, timesteps)
+
+#定义总步数和beta序列
+T=1000
+betas=linear_beta_schedule(T)
+```
+#h(2em)之所以要递增，是因为我们希望真实后验方差$ Sigma_q (t) = ((1-alpha_t)(1-overline(alpha_(t-1)))) / (1-overline(alpha_t)) bold(I) =: sigma_q^2 (t) bold(I) $平滑。这样每一步的KL散度尺度一致，训练平稳。
+
+#h(2em)剩余的前向过程就很简单了，只需注意维度匹配，原始图像分批后为$(B, C, H, W)$，对于Stanford_Cars数据集，以及我们设定的batch=64，原始数据应该是$(64, 3, 256, 256)$，而我们在预处理得到$x_0$过程中，为了加速训练，我们将图像缩放到$128 times 128$，因此$x_0$的维度是$(64, 3, 128, 128)$。数据处理组装的一些具体操作如下：
+```python
+#dataset.py
+IMG_SIZE=128
+BATCH_SIZE=64
+
+
+def load_transformed_dataset():
+    """
+    加载 Stanford Cars 数据集（仅训练集，因为测试集缺少类别标签），
+    并应用数据增强：随机裁剪缩放 + 随机水平翻转 + 归一化到 [-1, 1]。
+    """
+    data_transforms=[
+        # RandomResizedCrop：随机裁剪一块区域（面积 80%~100%），再缩放到 64×64
+        # 相比直接 Resize，保留了宽高比且提供了裁剪级数据增强
+        transforms.RandomResizedCrop(
+            IMG_SIZE,
+            scale=(0.8, 1.0),       # 裁剪面积占原图的 80%~100%
+            ratio=(0.75, 1.333),    # 宽高比范围 3:4 ~ 4:3
+            interpolation=transforms.InterpolationMode.BILINEAR,
+        ),
+        transforms.RandomHorizontalFlip(),#随机水平翻转，数据增强
+        transforms.ToTensor(),#转为张量，范围[0,1]
+        transforms.Lambda(lambda x:x*2.0-1.0)#归一化到[-1,1]，DDPM 的目标是预测标准高斯噪声ϵ∼N(0,I)，其值域就是集中在 [-1, 1] 附近。输入图像与噪声在同一个数值尺度下，损失函数的梯度才会稳定，不会因为数值范围不匹配而发散。这是 DDPM 训练的标配操作。
+    ]
+    data_transform=transforms.Compose(data_transforms)#组合多个变换步骤
+    #仅加载训练集（测试集缺少类别标签，且DDPM训练不需要标签）
+    train=torchvision.datasets.StanfordCars(root="./data",split="train",download=False,transform=data_transform)
+    return train
+
+# 实例化数据集和 DataLoader
+data=load_transformed_dataset()
+dataloader=DataLoader(data,batch_size=BATCH_SIZE,shuffle=True,drop_last=True)
+```
+#h(2em)剩余的前向过程实现如下：
+```python
+#forward.py
+#2.预计算前向过程所需的全部系数
+alphas=1.0-betas
+alphas_cumprod=torch.cumprod(alphas,dim=0)#overline(alpha_t)序列
+alphas_cumprod_prev=F.pad(alphas_cumprod[:-1],(1,0),value=1.0)#overline(alpha_(t-1))序列，第一项补一个1.0
+sqrt_alphas_cumprod=torch.sqrt(alphas_cumprod)#sqrt(overline(alpha_t))序列
+sqrt_one_minus_alphas_cumprod=torch.sqrt(1.0-alphas_cumprod)#sqrt(1-overline(alpha_t))序列
+sqrt_recip_alphas=torch.rsqrt(alphas)#sqrt(1/(alpha_t))序列
+posterior_variance=betas*(1.0-alphas_cumprod_prev)/ (1.0-alphas_cumprod)#后验方差序列sigma_t^2
+
+#3.工具函数
+def get_index_from_list(vals: torch.Tensor, t: torch.Tensor, x_shape: tuple) -> torch.Tensor:
+    """
+    从预计算的系数数组 vals (形状 [T]) 中，按照时间步 t 取出对应的值，
+    并将形状调整为 (batch_size, 1, 1, 1) 以便与图像张量进行广播。
+
+    参数:
+        vals:   形状为 (T,) 的一维张量，存储每一步的某个系数
+        t:      形状为 (batch_size,) 的整数张量，每个元素是一个时间步索引
+        x_shape:图像 x 的形状，例如 (batch_size,  channels, height, width)
+    返回:
+        形状为 (batch_size, 1, 1, 1) 的张量，每个样本取到自己的系数
+    """
+    batch_size=t.shape[0]
+    out=vals.gather(-1,t.cpu())#从vals中按照t索引取值，结果形状为(batch_size,)
+    return out.reshape(batch_size, *((1,)*(len(x_shape)-1))).to(t.device)#调整形状为(batch_size, 1, 1, 1)
+    
+
+def forward_diffusion_sample(x_0: torch.Tensor, t: torch.Tensor, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    给定干净图像 x_0 和时间步 t，利用闭式解一步生成带噪图像 x_t，
+    同时返回添加的真实噪声（供训练时作为标签）。
+
+    参数:
+        x_0:   干净图像，形状 (batch_size, C, H, W)
+        t:     时间步索引，形状 (batch_size,)
+        device:计算设备 ('cpu' 或 'cuda')
+    返回:
+        x_t:   带噪图像，形状同 x_0
+        noise: 添加的高斯噪声，形状同 x_0
+    """
+    noise=torch.randn_like(x_0)#生成与x_0形状相同的标准正态分布噪声
+    sqrt_alphas_cumprod_t=get_index_from_list(sqrt_alphas_cumprod,t,x_0.shape)#获取sqrt(overline(alpha_t))，形状为(batch_size, 1, 1, 1)
+    sqrt_one_minus_alphas_cumprod_t=get_index_from_list(sqrt_one_minus_alphas_cumprod,t,x_0.shape)#获取sqrt(1-overline(alpha_t))，形状为(batch_size, 1, 1, 1)
+    x_t=sqrt_alphas_cumprod_t.to(device)*x_0.to(device)+sqrt_one_minus_alphas_cumprod_t.to(device)*noise.to(device)#根据闭式解生成x_t
+    return x_t, noise.to(device)
+```
+#h(2em)而在计算$hat(epsilon)_(theta) (x_t, t)$时，我们还需要注入时间步信息$t$，以便网络知道当前的噪声水平。常见做法是将时间步$t$通过一个嵌入层（如正弦位置编码）转换为一个向量，然后与图像特征融合输入到网络中。具体实现如下：
+```python
+# x_t (B, 3, H, W)      t (B,)
+#     │                     │
+#     │ conv0               │ time_mlp → t (B, time_emb_dim)
+#     ▼                     │
+#  (B, 64, H, W)           │
+#     │                     │
+#     │ 下采样×5 ────────── t (传入每个 Block)
+#     │   Block0: 64→128  (H/2, W/2)
+#     │   Block1: 128→256 (H/4, W/4) → Attention(256ch)
+#     │   Block2: 256→512 (H/8, W/8) → Attention(512ch)
+#     │   Block3: 512→1024(H/16,W/16)
+#     │ 存储跳跃连接
+#     ▼
+#  (B, 1024, H/32, W/32) ← 最底层
+#     │
+#     │ 上采样×5 ────────── t + 拼接跳跃连接
+#     │   Block0: 1024→512 → Attention(512ch)
+#     │   Block1: 512→256  → Attention(256ch)
+#     │   Block2: 256→128
+#     │   Block3: 128→64
+#     ▼
+#  (B, 64, H, W)
+#     │
+#     │ output (1×1 Conv)
+#     ▼
+# 预测噪声 (B, 3, H, W)
+
+
+class AttentionBlock(nn.Module):
+    """
+    多头自注意力模块，用于捕捉全局依赖关系。
+    在低分辨率特征图（16×16、8×8）上使用，帮助模型理解整体结构。
+    """
+
+    def __init__(self, channels: int, num_heads: int = 4):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        assert self.head_dim * num_heads == channels, "channels 必须能被 num_heads 整除"
+
+        self.gnorm = nn.GroupNorm(32, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        residual = x
+
+        # GroupNorm 归一化
+        x = self.gnorm(x)
+
+        # 生成 Q, K, V
+        qkv = self.qkv(x)  # (B, 3C, H, W)
+        q, k, v = qkv.chunk(3, dim=1)  # 各 (B, C, H, W)
+
+        # 重塑为多头格式: (B, num_heads, head_dim, H*W)
+        q = q.reshape(B, self.num_heads, self.head_dim, H * W)
+        k = k.reshape(B, self.num_heads, self.head_dim, H * W)
+        v = v.reshape(B, self.num_heads, self.head_dim, H * W)
+
+        # 缩放点积注意力
+        scale = self.head_dim ** -0.5
+        attn = torch.softmax(q.transpose(-2, -1) @ k * scale, dim=-1)  # (B, heads, H*W, H*W)
+        out = (v @ attn.transpose(-2, -1))  # (B, heads, head_dim, H*W)
+
+        # 恢复形状
+        out = out.reshape(B, C, H, W)
+        out = self.proj(out)
+
+        return out + residual  # 残差连接
+
+
+class Block(nn.Module):
+
+    def __init__(self, in_ch: int, out_ch: int, time_emb_dim: int, up: bool = False):
+        super().__init__()
+        # 将时间嵌入映射到与输出通道相同的维度
+        self.time_mlp = nn.Linear(time_emb_dim, out_ch)
+
+        if up:
+            # 上采样时输入通道数翻倍（因为要拼接跳跃连接的特征）
+            self.conv1 = nn.Conv2d(2 * in_ch, out_ch, 3, padding=1)
+            # 转置卷积用于上采样，尺寸翻倍
+            self.transform = nn.ConvTranspose2d(out_ch, out_ch, 4, 2, 1)
+        else:
+            self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+            # 步长为2的卷积用于下采样，尺寸减半
+            self.transform = nn.Conv2d(out_ch, out_ch, 4, 2, 1)
+
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        # GroupNorm 替代 BatchNorm：在扩散模型中训练更稳定，不依赖 batch 统计量
+        num_groups = 32 if out_ch % 32 == 0 else out_ch
+        self.gnorm1 = nn.GroupNorm(num_groups, out_ch)
+        self.gnorm2 = nn.GroupNorm(num_groups, out_ch)
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        # 第一次卷积
+        h = self.gnorm1(self.relu(self.conv1(x)))
+        # 时间嵌入处理并注入
+        time_emb = self.relu(self.time_mlp(t))  # (B, out_ch)
+        # 扩展最后两个维度以匹配特征图形状 (B, out_ch, H, W)
+        time_emb = time_emb[(...,) + (None,) * 2]
+        h = h + time_emb
+        # 第二次卷积
+        h = self.gnorm2(self.relu(self.conv2(h)))
+        # 下采样或上采样
+        return self.transform(h)
+
+
+class SinusoidalPositionEmbeddings(nn.Module):
+    """
+    将时间步 t（整数）编码为正弦位置嵌入，类似于 Transformer 的位置编码。
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time: torch.Tensor) -> torch.Tensor:
+        device = time.device
+        half_dim = self.dim // 2
+        # 计算频率指数
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        # 时间步与频率相乘
+        embeddings = time[:, None] * embeddings[None, :]
+        # 分别计算 sin 和 cos 并拼接
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+
+
+class SimpleUnet(nn.Module):
+    """
+    简化版 U‑Net，专为 DDPM 设计。
+    输入：带噪图像 x_t (batch, 3, H, W) 和时间步 t (batch,)
+    输出：预测的噪声 (batch, 3, H, W)
+    """
+
+    def __init__(self):
+        super().__init__()
+        image_channels = 3
+        # 下采样通道数 (共5层)
+        down_channels = (64, 128, 256, 512, 1024)
+        # 上采样通道数 (对称)
+        up_channels = (1024, 512, 256, 128, 64)
+        out_dim = 3  # 输出噪声的通道数（RGB）
+        time_emb_dim = 32  # 时间嵌入的维度
+
+        # 时间嵌入：正弦位置编码 + 线性层 + ReLU
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.ReLU(),
+        )
+
+        # 初始卷积
+        self.conv0 = nn.Conv2d(image_channels, down_channels[0], 3, padding=1)
+
+        # 下采样路径（5个 Block）
+        self.downs = nn.ModuleList([
+            Block(down_channels[i], down_channels[i+1], time_emb_dim)
+            for i in range(len(down_channels) - 1)
+        ])
+
+        # 注意力层：在低分辨率处（16×16 和 8×8）插入，捕捉全局结构
+        # down_channels: (64, 128, 256, 512, 1024)
+        # Block 0: 64→128 (32→16), Block 1: 128→256 (16→8)
+        # Block 2: 256→512 (8→4),   Block 3: 512→1024 (4→2)
+        # 在 256ch (16×16) 和 512ch (8×8) 处加注意力
+        self.attn_down1 = AttentionBlock(256)   # 16×16
+        self.attn_down2 = AttentionBlock(512)   # 8×8
+
+        # 上采样路径（5个 Block, up=True）
+        self.ups = nn.ModuleList([
+            Block(up_channels[i], up_channels[i+1], time_emb_dim, up=True)
+            for i in range(len(up_channels) - 1)
+        ])
+
+        # 上采样路径中的注意力（对称）
+        # up_channels: (1024, 512, 256, 128, 64)
+        # Block 0: 1024→512 (2→4), Block 1: 512→256 (4→8)
+        # Block 2: 256→128 (8→16), Block 3: 128→64 (16→32)
+        # 在 512ch (4×4) 和 256ch (8×8) 处加注意力
+        self.attn_up1 = AttentionBlock(512)     # 4×4
+        self.attn_up2 = AttentionBlock(256)     # 8×8
+
+        # 最终输出卷积（1×1 卷积，不改变空间尺寸）
+        self.output = nn.Conv2d(up_channels[-1], out_dim, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        # 1. 时间编码
+        t = self.time_mlp(timestep)  # (B, time_emb_dim)
+
+        # 2. 初始投影
+        x = self.conv0(x)
+
+        # 3. 下采样并存储跳跃连接
+        residual_inputs = []
+        for i, down in enumerate(self.downs):
+            x = down(x, t)
+            residual_inputs.append(x)
+            # 在 256ch (16×16) 和 512ch (8×8) 后插入注意力
+            if i == 1:  # 128→256 之后，256ch, 16×16
+                x = self.attn_down1(x)
+            elif i == 2:  # 256→512 之后，512ch, 8×8
+                x = self.attn_down2(x)
+
+        # 4. 上采样并拼接跳跃连接
+        for i, up in enumerate(self.ups):
+            residual_x = residual_inputs.pop()
+            # 在通道维度上拼接（通道数翻倍）
+            x = torch.cat((x, residual_x), dim=1)
+            x = up(x, t)
+            # 在 512ch (4×4) 和 256ch (8×8) 后插入注意力
+            if i == 0:  # 1024→512 之后，512ch, 4×4
+                x = self.attn_up1(x)
+            elif i == 1:  # 512→256 之后，256ch, 8×8
+                x = self.attn_up2(x)
+
+        # 5. 输出
+        return self.output(x)
+```
+#h(2em)这里我们介绍一下U-net的几个组件。
+
+#h(2em)首先是为了注入时间步信息，我们借鉴了Transformer中的位置编码，设计了一个SinusoidalPositionEmbeddings类，将整数时间步t编码为一个向量。这个向量通过一个线性层和ReLU激活后注入到每个Block中，帮助网络知道当前的噪声水平。
+
+#h(2em)首先是定义：
+$ op("PE")(op("pos"),2i)=sin(frac(op("pos"),10000^((2i)/d)))\ op("PE")(op("pos"),2i+1)=cos(frac(op("pos"),10000^((2i)/d))) $
+- 其中 $op("pos")$ 是位置索引（在这里是时间步t），$i$ 是维度索引，$d$ 是嵌入维度。这个编码方式使得不同时间步的编码具有不同的频率成分，帮助模型区分不同的噪声水平。
+
+#h(2em)得到时间嵌入后，它通过一个简单的 MLP（线性层 + ReLU）进一步变换，随后被送入 U-Net 的每一个 #strong[Block] 中，与图像特征相加。下面我们来看 Block 的设计。
+
+#h(2em)#strong[Block：下采样与上采样的基本单元。] U-Net 的核心构件是 `Block` 类，它同时承担特征提取与尺寸变换两个职责。一个 Block 的内部流程如下：
+
+#h(2em)第一步——第一次卷积与时间注入：
+$ h = op("GroupNorm")(op("ReLU")(op("Conv2d")(x))) + op("time_mlp")(t) $
+
+#h(2em)输入特征 $x$ 先经过 `Conv2d(in_ch, out_ch, 3, padding=1)` 改变通道数，再依次通过 ReLU 激活和 GroupNorm 归一化。与此同时，时间嵌入 $t$ 通过 `time_mlp`（一个线性层 + ReLU）被映射到与输出通道数相同的维度，然后直接与特征图相加。这一步是时间条件注入的关键——网络由此"知道"当前处于扩散的哪个阶段。
+
+#h(2em)第二步——第二次卷积：
+$ h = op("GroupNorm")(op("ReLU")(op("Conv2d")(h))) $
+
+#h(2em)再经过一组 Conv2d + ReLU + GroupNorm，进一步提炼特征。
+
+#h(2em)第三步——尺寸变换（下采样或上采样）：
+$ h = op("transform")(h) $
+
+#h(2em)这是 Block 区别于普通残差块的地方。`transform` 根据 `up` 参数的不同，执行两种相反的操作：
+
+- #strong[下采样（up = false）]：使用步长为 2 的卷积 `Conv2d(out_ch, out_ch, 4, 2, 1)`。卷积核大小为 $4 times 4$，步长为 $2$，填充为 $1$。输出尺寸恰好减半：$H' = floor((H + 2 dot 1 - 4) / 2) + 1 = floor((H-2)/2) + 1 = H/2$（当 $H$ 为偶数时精确成立）。通道数不变，空间分辨率下降，感受野扩大。
+
+- #strong[上采样（up = true）]：使用转置卷积 `ConvTranspose2d(out_ch, out_ch, 4, 2, 1)`。同样 $4 times 4$ 核、步长 $2$、填充 $1$，但效果相反——输出尺寸翻倍：$H' = (H-1) dot 2 - 2 dot 1 + 4 = 2H$。这等价于先对特征图进行最近邻上采样，再执行一次普通卷积。
+
+#h(2em)需要注意的是，上采样 Block 的输入通道数是 $2 times "in_ch"$，而非 `in_ch`。这是因为 U-Net 在上采样时会通过 #strong[跳跃连接] 将下采样路径中对应分辨率的特征图拼接到当前特征图上：$x = op("cat")(x, x_("skip"), op("dim")=1)$。这样一来，上采样路径既能获取深层的全局语义信息，又能保留浅层的局部细节——这对于去噪任务至关重要，因为网络既要"看懂"图像的整体结构，又要精确恢复每个像素的值。
+
+#h(2em)#strong[为什么用 GroupNorm 而非 BatchNorm？] 在扩散模型的训练中，每个 batch 内的 $x_t$ 来自不同的时间步 $t$，其噪声水平差异很大。BatchNorm 会在 batch 维度上计算均值和方差，导致不同噪声水平样本的统计量相互污染。GroupNorm 将通道分组，在每组内独立归一化，完全避免了跨样本的依赖，训练更稳定。实践中取 `num_groups = 32`（当通道数能被 32 整除时），这是图像生成任务中的常见选择。
+
+#h(2em)#strong[注意力机制：捕捉全局依赖。] 在 U-Net 的深层（低分辨率特征图，如 $16 times 16$ 和 $8 times 8$），我们插入了多头自注意力模块 `AttentionBlock`。其动机在于：卷积操作的感受野是局部的（由卷积核大小决定），即使通过层层下采样扩大了感受野，网络仍然难以直接建模图像中相距较远的两个区域之间的关系。而自注意力机制允许特征图上的每一个位置直接关注所有其他位置，天然适合捕捉全局结构。
+
+#h(2em)具体实现如下。输入特征图 $x in RR^(B times C times H times W)$ 首先通过 GroupNorm 归一化，然后通过一个 $1 times 1$ 卷积生成查询 $Q$、键 $K$、值 $V$：
+$ Q, K, V = op("chunk")(op("Conv2d")(x), 3, op("dim")=1) $
+三者形状均为 $(B, C, H, W)$。
+
+#h(2em)随后将每个张量重塑为多头格式。设注意力头数为 $h = 4$，每头维度 $d_h = C / h$：
+$ Q, K, V in RR^(B times h times d_h times (H W)) $
+即把通道维度拆成"头数 × 每头维度"，空间维度展平为一维序列。
+
+#h(2em)接着计算缩放点积注意力：
+$ op("Attention")(Q, K, V) = op("softmax")frac(Q K^T, sqrt(d_h)) V $
+其中 $Q K^T$ 产生 $(B, h, H W, H W)$ 的注意力矩阵，每个位置 $(i, j)$ 表示位置 $i$ 对位置 $j$ 的关注程度。除以 $sqrt(d_h)$ 是为了防止点积值过大导致 softmax 梯度消失。
+
+#h(2em)注意力输出再重塑回 $(B, C, H, W)$，经过一个 $1 times 1$ 卷积投影，最后与原始输入相加（残差连接）：
+$ x_("out") = x + op("proj")(op("Attention")(Q, K, V)) $
+
+#h(2em)残差连接保证了即使注意力学到的东西不多，网络至少可以保留原有的卷积特征，不会因为引入注意力而退化。
+
+#h(2em)#strong[为什么只在低分辨率处使用注意力？] 自注意力的计算复杂度为 $O((H W)^2 dot C)$，在 $128 times 128$ 的特征图上运行会非常昂贵。而在 $16 times 16$ 和 $8 times 8$ 分辨率下，序列长度分别为 $256$ 和 $64$，计算量可控。更重要的是，低分辨率特征图的每个位置已经浓缩了较大感受野的信息，此时用注意力来协调全局关系最为高效——就像一个人先看清整体布局，再去修饰细节。
+
+#h(2em)#strong[SimpleUnet：整体结构。] 将上述组件串联起来，就是我们的 `SimpleUnet`。其前向传播流程可以概括为五个阶段：
+
+#h(2em)1. #strong[时间编码]：整数时间步 $t$ → 正弦位置编码 → MLP → 时间嵌入向量 $(B, 32)$。
+
+#h(2em)2. #strong[初始投影]：输入图像 $x_t in RR^(B times 3 times H times W)$ 通过 `conv0` 投影到 $(B, 64, H, W)$。
+
+#h(2em)3. #strong[下采样路径]：依次经过 4 个下采样 Block，通道数逐层翻倍（$64 -> 128 -> 256 -> 512 -> 1024$），空间尺寸逐层减半（$H -> H/2 -> H/4 -> H/8 -> H/16 -> H/32$）。在 $256$ 通道（$16 times 16$）和 $512$ 通道（$8 times 8$）后分别插入注意力模块。每个 Block 的输出被存入列表，作为后续上采样时的跳跃连接。
+
+#h(2em)4. #strong[上采样路径]：从最底层 $(B, 1024, H/32, W/32)$ 开始，依次经过 4 个上采样 Block。每个 Block 先将当前特征图与对应下采样层存储的特征图在通道维度拼接（通道数翻倍），再执行特征提取和转置卷积上采样。通道数逐层减半（$1024 -> 512 -> 256 -> 128 -> 64$），空间尺寸逐层翻倍，最终恢复到 $(B, 64, H, W)$。在 $512$ 通道（$4 times 4$）和 $256$ 通道（$8 times 8$）后对称地插入注意力模块。
+
+#h(2em)5. #strong[输出投影]：通过 $1 times 1$ 卷积将 $64$ 通道映射回 $3$ 通道，输出预测噪声 $hat(epsilon)_(theta) (x_t, t) in RR^(B times 3 times H times W)$。
+
+#h(2em)总得来说，下采样提取多尺度特征并扩大感受野，注意力在低分辨率层捕捉全局结构，上采样借助跳跃连接恢复细节，时间嵌入贯穿始终让网络感知噪声水平。
