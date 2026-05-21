@@ -63,5 +63,6 @@ if __name__=="__main__":
     print("一个batch的图像张量形状:",images.shape) #(BATCH_SIZE, 3, 64, 64)
     show_tensor_image(images)#展示一个 batch 的第一张图像
     plt.show()
+
     
     

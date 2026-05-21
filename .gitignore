@@ -1,2 +1,19 @@
-# Large model files
-code/private/Diffusion_Model_from_Scratch/models/ddpm_model.pth
+# Python 缓存
+__pycache__/
+
+# 训练日志
+*.log
+
+# 大型模型文件
+code/private/Diffusion_Model_from_Scratch/models/*.pth
+
+# 数据集目录
+code/private/Diffusion_Model_from_Scratch/data/
+code/private/CNN/data/
+
+# 生成输出
+code/private/Diffusion_Model_from_Scratch/outputs/
+
+# Claude Code 配置
+code/private/Diffusion_Model_from_Scratch/.claude/
+code/private/Diffusion_Model_from_Scratch/CLAUDE.md

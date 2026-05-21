@@ -10,8 +10,8 @@ from torch import nn
 #     │                     │
 #     │ 下采样×5 ────────── t (传入每个 Block)
 #     │   Block0: 64→128  (H/2, W/2)
-#     │   Block1: 128→256 (H/4, W/4) → Attention(256ch)
-#     │   Block2: 256→512 (H/8, W/8) → Attention(512ch)
+#     │   Block1: 128→256 (H/4, W/4)  → Attention(256ch)
+#     │   Block2: 256→512 (H/8, W/8)  → Attention(512ch)
 #     │   Block3: 512→1024(H/16,W/16)
 #     │ 存储跳跃连接
 #     ▼
@@ -150,7 +150,7 @@ class SimpleUnet(nn.Module):
         # 上采样通道数 (对称)
         up_channels = (1024, 512, 256, 128, 64)
         out_dim = 3  # 输出噪声的通道数（RGB）
-        time_emb_dim = 32  # 时间嵌入的维度
+        time_emb_dim = 128  # 时间嵌入的维度（增大以提升对时间步的感知精度）
 
         # 时间嵌入：正弦位置编码 + 线性层 + ReLU
         self.time_mlp = nn.Sequential(
@@ -168,13 +168,14 @@ class SimpleUnet(nn.Module):
             for i in range(len(down_channels) - 1)
         ])
 
-        # 注意力层：在低分辨率处（16×16 和 8×8）插入，捕捉全局结构
+        # 注意力层：在低分辨率层插入，捕捉全局结构
+        # 128×128 输入下：256ch→32×32 (1024 tokens), 512ch→16×16 (256 tokens)
+        # 注意：64×64 (4096 tokens) 注意力显存过大，不在该层使用
         # down_channels: (64, 128, 256, 512, 1024)
-        # Block 0: 64→128 (32→16), Block 1: 128→256 (16→8)
-        # Block 2: 256→512 (8→4),   Block 3: 512→1024 (4→2)
-        # 在 256ch (16×16) 和 512ch (8×8) 处加注意力
-        self.attn_down1 = AttentionBlock(256)   # 16×16
-        self.attn_down2 = AttentionBlock(512)   # 8×8
+        # Block 0: 64→128 (128→64), Block 1: 128→256 (64→32)
+        # Block 2: 256→512 (32→16), Block 3: 512→1024 (16→8)
+        self.attn_down1 = AttentionBlock(256)   # 32×32
+        self.attn_down2 = AttentionBlock(512)   # 16×16
 
         # 上采样路径（5个 Block, up=True）
         self.ups = nn.ModuleList([
@@ -182,13 +183,12 @@ class SimpleUnet(nn.Module):
             for i in range(len(up_channels) - 1)
         ])
 
-        # 上采样路径中的注意力（对称）
+        # 上采样路径中的注意力（对称，不含 64×64）
         # up_channels: (1024, 512, 256, 128, 64)
-        # Block 0: 1024→512 (2→4), Block 1: 512→256 (4→8)
-        # Block 2: 256→128 (8→16), Block 3: 128→64 (16→32)
-        # 在 512ch (4×4) 和 256ch (8×8) 处加注意力
-        self.attn_up1 = AttentionBlock(512)     # 4×4
-        self.attn_up2 = AttentionBlock(256)     # 8×8
+        # Block 0: 1024→512 (8→16),  Block 1: 512→256 (16→32)
+        # Block 2: 256→128 (32→64),  Block 3: 128→64 (64→128)
+        self.attn_up0 = AttentionBlock(512)     # 8×8
+        self.attn_up1 = AttentionBlock(256)     # 16×16
 
         # 最终输出卷积（1×1 卷积，不改变空间尺寸）
         self.output = nn.Conv2d(up_channels[-1], out_dim, kernel_size=1)
@@ -205,10 +205,10 @@ class SimpleUnet(nn.Module):
         for i, down in enumerate(self.downs):
             x = down(x, t)
             residual_inputs.append(x)
-            # 在 256ch (16×16) 和 512ch (8×8) 后插入注意力
-            if i == 1:  # 128→256 之后，256ch, 16×16
+            # 在 256ch (32×32) 和 512ch (16×16) 后插入注意力
+            if i == 1:  # 128→256 之后，256ch, 32×32
                 x = self.attn_down1(x)
-            elif i == 2:  # 256→512 之后，512ch, 8×8
+            elif i == 2:  # 256→512 之后，512ch, 16×16
                 x = self.attn_down2(x)
 
         # 4. 上采样并拼接跳跃连接
@@ -217,11 +217,11 @@ class SimpleUnet(nn.Module):
             # 在通道维度上拼接（通道数翻倍）
             x = torch.cat((x, residual_x), dim=1)
             x = up(x, t)
-            # 在 512ch (4×4) 和 256ch (8×8) 后插入注意力
-            if i == 0:  # 1024→512 之后，512ch, 4×4
+            # 在 512ch (8×8) 和 256ch (16×16) 后插入注意力
+            if i == 0:  # 1024→512 之后，512ch, 8×8
+                x = self.attn_up0(x)
+            elif i == 1:  # 512→256 之后，256ch, 16×16
                 x = self.attn_up1(x)
-            elif i == 1:  # 512→256 之后，256ch, 8×8
-                x = self.attn_up2(x)
 
         # 5. 输出
         return self.output(x)

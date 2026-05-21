@@ -7,7 +7,7 @@ from unet import SimpleUnet
 from dataset import dataloader, IMG_SIZE, BATCH_SIZE
 from sample import sample_plot_image      # 从 sample.py 导入
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda:0" if torch.cuda.is_available() else "cpu"  # CUDA_VISIBLE_DEVICES=2 时 cuda:0 即物理 GPU 2
 
 model = SimpleUnet().to(device)
 optimizer = Adam(model.parameters(), lr=0.001)
